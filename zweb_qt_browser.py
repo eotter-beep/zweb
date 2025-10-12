@@ -1,4 +1,11 @@
-"""PyQt front-end for interacting with the ZWeb DNS helpers via sockets."""
+"""Graphical front-end for interacting with the ZWeb DNS helpers via sockets.
+
+The original application only supported PyQt which made it difficult to run in
+environments where Qt bindings are unavailable.  The module now prefers PyQt5
+but falls back to GTK (via PyGObject) when Qt cannot be imported.  The public
+``main`` entry point accepts a ``--backend`` argument that allows callers to
+force a particular toolkit while retaining the automatic behaviour by default.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +29,18 @@ except ImportError as exc:  # pragma: no cover - import guard for environments w
     _IMPORT_ERROR = exc
 else:
     _IMPORT_ERROR = None
+
+try:  # pragma: no cover - import guard for environments without GTK
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib, Gtk  # type: ignore[attr-defined]
+except (ImportError, ValueError) as exc:  # pragma: no cover - import guard
+    Gtk = None  # type: ignore[assignment]
+    GLib = None  # type: ignore[assignment]
+    _GTK_IMPORT_ERROR = exc
+else:
+    _GTK_IMPORT_ERROR = None
 
 import zweb_socket_server
 
@@ -310,20 +329,180 @@ if QtCore and QtGui:  # pragma: no branch - depends on import guard
             super().closeEvent(event)
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    if _IMPORT_ERROR is not None:
-        print("PyQt5 is required to run the ZWeb browser:", _IMPORT_ERROR, file=sys.stderr)
-        return 1
+if Gtk:  # pragma: no branch - depends on import guard
 
-    parser = argparse.ArgumentParser(description="Run the PyQt-based ZWeb browser")
-    parser.add_argument("--host", default=HOST, help="Socket server host (default: %(default)s)")
-    parser.add_argument("--port", type=int, default=PORT, help="Socket server port (default: %(default)s)")
-    parser.add_argument(
-        "--no-server",
-        action="store_true",
-        help="Do not auto-start the bundled socket server",
-    )
-    args = parser.parse_args(argv)
+    class GtkMainWindow(Gtk.Window):
+        """GTK implementation mirroring the PyQt interface."""
+
+        def __init__(self, client: LookupClient, p2p_manager: zweb_p2p.P2PManager) -> None:
+            super().__init__(title="ZWeb Browser")
+
+            self._client = client
+            self._p2p_manager = p2p_manager
+            self._current_alias: Optional[str] = None
+            self._last_query: Optional[str] = None
+
+            self.set_border_width(12)
+            self.set_default_size(540, 360)
+
+            container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            self.add(container)
+
+            entry_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            container.pack_start(entry_box, False, False, 0)
+
+            self._input = Gtk.Entry()
+            self._input.set_placeholder_text("Enter a domain or URL")
+            entry_box.pack_start(self._input, True, True, 0)
+
+            self._lookup_button = Gtk.Button(label="Lookup")
+            self._lookup_button.connect("clicked", self._trigger_lookup)
+            entry_box.pack_start(self._lookup_button, False, False, 0)
+
+            self._download_button = Gtk.Button(label="Download & Share")
+            self._download_button.set_sensitive(False)
+            self._download_button.connect("clicked", self._download_current_site)
+            container.pack_start(self._download_button, False, False, 0)
+
+            grid = Gtk.Grid(row_spacing=6, column_spacing=12)
+            container.pack_start(grid, False, False, 0)
+
+            self._hostname_value = Gtk.Label(label="–")
+            self._zone_value = Gtk.Label(label="–")
+            self._node_value = Gtk.Label(label="–")
+            self._name_value = Gtk.Label(label="–")
+
+            for label in (self._hostname_value, self._zone_value, self._node_value, self._name_value):
+                label.set_selectable(True)
+
+            labels = [
+                ("Hostname:", self._hostname_value),
+                ("Zone (zwb):", self._zone_value),
+                ("Node:", self._node_value),
+                ("Full name:", self._name_value),
+            ]
+
+            for row, (title, widget) in enumerate(labels):
+                grid.attach(Gtk.Label(label=title, xalign=0), 0, row, 1, 1)
+                grid.attach(widget, 1, row, 1, 1)
+
+            p2p_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            container.pack_start(p2p_box, False, False, 0)
+
+            self._server_ip_input = Gtk.Entry()
+            self._server_ip_input.set_placeholder_text("P2P public IP address")
+            self._server_ip_input.set_text(zweb_p2p.DEFAULT_PUBLIC_IP)
+            p2p_box.pack_start(self._server_ip_input, True, True, 0)
+
+            self._start_server_button = Gtk.Button(label="Start P2P Server")
+            self._start_server_button.connect("clicked", self._start_p2p_server)
+            p2p_box.pack_start(self._start_server_button, False, False, 0)
+
+            self._stop_server_button = Gtk.Button(label="Stop P2P Server")
+            self._stop_server_button.connect("clicked", self._stop_p2p_server)
+            self._stop_server_button.set_sensitive(False)
+            p2p_box.pack_start(self._stop_server_button, False, False, 0)
+
+            self._p2p_status = Gtk.Label(label="P2P server stopped")
+            self._status = Gtk.Label(label="Ready")
+
+            container.pack_start(self._p2p_status, False, False, 0)
+            container.pack_start(self._status, False, False, 0)
+            container.pack_start(Gtk.Box(), True, True, 0)
+
+        def _trigger_lookup(self, *_: object) -> None:
+            query = self._input.get_text()
+            if not query.strip():
+                self._status.set_text("Please enter a domain or URL")
+                return
+
+            self._lookup_button.set_sensitive(False)
+            self._download_button.set_sensitive(False)
+            self._status.set_text("Looking up…")
+            self._last_query = query
+
+            thread = threading.Thread(target=self._lookup_in_background, args=(query,), daemon=True)
+            thread.start()
+
+        def _lookup_in_background(self, query: str) -> None:
+            try:
+                result = self._client.lookup(query)
+            except LookupError as exc:
+                GLib.idle_add(self._handle_error, str(exc))
+            else:
+                GLib.idle_add(self._handle_result, result)
+
+        def _handle_result(self, result: LookupResult) -> None:
+            self._hostname_value.set_text(result.hostname or "–")
+            self._zone_value.set_text(result.zone or "–")
+            self._node_value.set_text(result.node or "–")
+            self._name_value.set_text(result.name or "–")
+            self._status.set_text("Lookup successful")
+            self._lookup_button.set_sensitive(True)
+            self._download_button.set_sensitive(True)
+
+            previous_alias = self._current_alias
+            self._current_alias = result.name or result.zone or result.hostname
+            if previous_alias and previous_alias != self._current_alias:
+                self._p2p_manager.mark_site_cached(previous_alias)
+
+        def _handle_error(self, message: str) -> None:
+            self._status.set_text(message)
+            self._lookup_button.set_sensitive(True)
+            self._download_button.set_sensitive(False)
+
+        def _download_current_site(self, *_: object) -> None:
+            if not self._current_alias:
+                self._status.set_text("No lookup data available")
+                return
+
+            source = self._last_query or self._hostname_value.get_text()
+            alias = self._current_alias
+            hostname = self._hostname_value.get_text()
+
+            if not source.strip():
+                self._status.set_text("No source URL to download")
+                return
+
+            try:
+                site = self._p2p_manager.install_site(source.strip(), alias, hostname.strip())
+            except RuntimeError as exc:
+                self._status.set_text(str(exc))
+            else:
+                self._status.set_text(f"Cached site at {site.cache_path}")
+
+        def _start_p2p_server(self, *_: object) -> None:
+            ip_address = self._server_ip_input.get_text().strip() or zweb_p2p.DEFAULT_PUBLIC_IP
+            try:
+                self._p2p_manager.start_server(ip_address)
+            except RuntimeError as exc:
+                self._p2p_status.set_text(str(exc))
+                return
+
+            self._p2p_status.set_text(
+                f"P2P server broadcasting on {ip_address}:{zweb_p2p.DEFAULT_PORT}"
+            )
+            self._start_server_button.set_sensitive(False)
+            self._stop_server_button.set_sensitive(True)
+
+        def _stop_p2p_server(self, *_: object) -> None:
+            self._p2p_manager.stop_server()
+            self._p2p_status.set_text("P2P server stopped")
+            self._start_server_button.set_sensitive(True)
+            self._stop_server_button.set_sensitive(False)
+
+        def perform_shutdown(self) -> None:
+            self._p2p_manager.stop_server()
+            self._p2p_manager.cleanup_on_exit()
+
+
+def _run_with_qt(args: argparse.Namespace) -> int:
+    if _IMPORT_ERROR is not None or QtWidgets is None:
+        message = "PyQt5 is required but not available"
+        if _IMPORT_ERROR is not None:
+            message = f"{message}: {_IMPORT_ERROR}"
+        print(message, file=sys.stderr)
+        return 1
 
     if not args.no_server:
         try:
@@ -339,6 +518,70 @@ def main(argv: Optional[list[str]] = None) -> int:
     window = MainWindow(client, p2p_manager)
     window.show()
     return app.exec_()
+
+
+def _run_with_gtk(args: argparse.Namespace) -> int:
+    if Gtk is None or _GTK_IMPORT_ERROR is not None:
+        message = "GTK (PyGObject) is required but not available"
+        if _GTK_IMPORT_ERROR is not None:
+            message = f"{message}: {_GTK_IMPORT_ERROR}"
+        print(message, file=sys.stderr)
+        return 1
+
+    if not args.no_server:
+        try:
+            ensure_server_running(args.host, args.port)
+        except Exception as exc:  # pragma: no cover - defensive user feedback
+            print(f"Failed to start socket server: {exc}", file=sys.stderr)
+            return 1
+
+    client = LookupClient(args.host, args.port)
+    p2p_manager = zweb_p2p.P2PManager()
+    window = GtkMainWindow(client, p2p_manager)
+
+    def _on_destroy(*_: object) -> None:
+        window.perform_shutdown()
+        Gtk.main_quit()
+
+    window.connect("destroy", _on_destroy)
+    window.show_all()
+    Gtk.main()
+    return 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Run the ZWeb graphical browser")
+    parser.add_argument("--host", default=HOST, help="Socket server host (default: %(default)s)")
+    parser.add_argument("--port", type=int, default=PORT, help="Socket server port (default: %(default)s)")
+    parser.add_argument(
+        "--no-server",
+        action="store_true",
+        help="Do not auto-start the bundled socket server",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "qt", "gtk"],
+        default="auto",
+        help="Preferred UI backend (default: %(default)s)",
+    )
+    args = parser.parse_args(argv)
+
+    if args.backend == "qt":
+        return _run_with_qt(args)
+    if args.backend == "gtk":
+        return _run_with_gtk(args)
+
+    if QtWidgets is not None and _IMPORT_ERROR is None:
+        return _run_with_qt(args)
+    if Gtk is not None and _GTK_IMPORT_ERROR is None:
+        return _run_with_gtk(args)
+
+    print("No supported graphical backend is available (PyQt5 or GTK required)", file=sys.stderr)
+    if _IMPORT_ERROR is not None:
+        print(f"PyQt5 error: {_IMPORT_ERROR}", file=sys.stderr)
+    if _GTK_IMPORT_ERROR is not None:
+        print(f"GTK error: {_GTK_IMPORT_ERROR}", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

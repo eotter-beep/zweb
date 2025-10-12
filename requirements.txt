@@ -1,0 +1,3 @@
+# ZWeb desktop requirements
+PyQt5>=5.15
+PyGObject>=3.42; platform_system != "Windows"
