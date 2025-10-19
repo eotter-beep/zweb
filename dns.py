@@ -40,6 +40,7 @@ normalises it into a hostname and prints the three values described above.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import List, Tuple
 from urllib.parse import urlparse
 
@@ -217,8 +218,8 @@ def name(domain: str, suffix: str = "zwb") -> str:
     return _replace_suffix(hostname, suffix)
 
 
-def describe(raw: str) -> DomainParts:
-    """Parse ``raw`` and describe its DNS components."""
+def _describe_uncached(raw: str) -> DomainParts:
+    """Internal helper implementing :func:`describe` without caching."""
 
     hostname, path_segments = _split_hostname_and_path(raw)
     if not hostname:
@@ -233,6 +234,31 @@ def describe(raw: str) -> DomainParts:
     zone_value = zone(hostname)
     node_value = node(hostname)
     return DomainParts(hostname=hostname, zone=zone_value, node=node_value, name=name(hostname))
+
+
+@lru_cache(maxsize=512)
+def describe(raw: str) -> DomainParts:
+    """Parse ``raw`` and describe its DNS components."""
+
+    return _describe_uncached(raw)
+
+
+def build_error_page(message: str, request: str) -> str:
+    """Return a lightweight HTML page describing a lookup failure."""
+
+    safe_request = request.strip() or "(empty request)"
+    safe_message = message.strip() or "Lookup failed"
+    return (
+        "<html><head><title>DNS Lookup Error</title>"
+        "<style>body{font-family:Arial,Helvetica,sans-serif;margin:2em;}"
+        "h1{color:#b00;}code{background:#f5f5f5;padding:0.2em 0.4em;}"
+        "</style></head><body>"
+        "<h1>Domain lookup failed</h1>"
+        f"<p>The DNS helper was unable to resolve <code>{safe_request}</code>.</p>"
+        f"<p><strong>Reason:</strong> {safe_message}</p>"
+        "<p>Please verify the address and try again or choose a different server.</p>"
+        "</body></html>"
+    )
 
 
 def main() -> None:
